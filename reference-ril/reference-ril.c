@@ -241,8 +241,12 @@ static void onRadioPowerOn()
     /*  TI specific -- enable NITZ unsol notifs */
     at_send_command("AT%CTZV=1", NULL);
 #endif
-    // Modem wakeup 
+    /* ZTE modem - Wait for complete modem wakeup */
     sleep(10);
+
+    /* ZTE modem - automatic network selection, GSM+WCDMA */
+    at_send_command("AT+ZSNT=0,0,0", NULL);
+
     pollSIMState(NULL);
 }
 
@@ -297,6 +301,38 @@ static void requestRadioPower(void *data, size_t datalen, RIL_Token t)
     return;
 error:
     at_response_free(p_response);
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+}
+
+static void requestBasebandVersion(void *data, size_t datalen, RIL_Token t)
+{
+    int err = 0;
+    ATResponse *p_response = NULL;
+    char *response;
+    char *line;
+
+    err = at_send_command_singleline("AT+CGMR", "+CGMR:", &p_response);
+    if (err < 0 || p_response->success == 0) {
+        goto error;
+    }
+
+    line = p_response->p_intermediates->line;
+    err = at_tok_start(&line);
+    if (err < 0) {
+        goto error;
+    }
+    err = at_tok_nextstr(&line, &response);
+    if (err < 0) {
+        goto error;
+    }
+    ALOGD("Baseband: %s", response);
+
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, sizeof(int));
+    at_response_free(p_response);
+    return;
+error:
+    at_response_free(p_response);
+    ALOGE("requestBasebandVersion must never return error when radio is on");
     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
 }
 
@@ -881,32 +917,28 @@ static void requestScreenState(void *data, size_t datalen, RIL_Token t) {
    assert(datalen >= sizeof (int *));
    screenState = ((int*) data)[0];
 
-/*
-if (screenState == 1) {
-// Screen is on - be sure to enable all unsolicited notifications again
-err = at_send_command("AT+CREG=2", NULL);
-if (err < 0) goto error;
-err = at_send_command("AT+CGREG=2", NULL);
-if (err < 0) goto error;
-//err = at_send_command("AT+CGEREP=2,0", NULL);
-//if (err < 0) goto error;
-enqueueRILEvent(CMD_QUEUE_AUXILIARY, pollAndDispatchSignalStrength, NULL, NULL);
-} else if (screenState == 0) {
-// Screen is off - disable all unsolicited notifications
-err = at_send_command("AT+CREG=0", NULL);
-if (err < 0) goto error;
-err = at_send_command("AT+CGREG=0", NULL);
-if (err < 0) goto error;
-err = at_send_command("AT+CGEREP=0,0", NULL);
-if (err < 0) goto error;
-} else {
-// Not a defined value - error
-goto error;
-}
-*/
+   if (screenState == 1) {
+       /* Screen is on - be sure to enable all unsolicited notifications again */
+       err = at_send_command("AT+CREG=2", NULL);
+       if (err < 0) goto error;
+       err = at_send_command("AT+CGREG=2", NULL);
+       if (err < 0) goto error;
+       /* need to implement this ?
+       enqueueRILEvent(CMD_QUEUE_AUXILIARY, pollAndDispatchSignalStrength, NULL, NULL);
+       */
+   } else if (screenState == 0) {
+        /* Screen is off - disable all unsolicited notifications */
+        err = at_send_command("AT+CREG=0", NULL);
+        if (err < 0) goto error;
+        err = at_send_command("AT+CGREG=0", NULL);
+        if (err < 0) goto error;
+   } else {
+        /* Not a defined value - error */
+        goto error;
+   }
 
-    RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
-    return;
+   RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+   return;
 
 error:
     ALOGE("ERROR: requestScreenState failed");
@@ -1090,6 +1122,51 @@ static void requestRegistrationState(int request, void *data,
 
     if (count > 3)
         asprintf(&responseStr[3], "%d", response[3]);
+
+/* ZTE MF210 modem 
+   Using +ZPAS? to get network type */
+    cmd = "AT+ZPAS?";
+    prefix = "+ZPAS:";
+    err = at_send_command_singleline(cmd, prefix, &p_response);
+    if (err != 0) goto error;
+    line = p_response->p_intermediates->line;
+    err = at_tok_start(&line);
+    if (err < 0) goto error;
+/* Possible values for CGREG technology values
+0 GSM
+1 GSM Compact
+2 UTRAN
+3 GSM w/EGPRS
+4 UTRAN w/HSDPA
+5 UTRAN w/HSUPA
+6 UTRAN w/HSDPA and HSUPA
+7 E-UTRAN
+Note - UTRAN is a short for UMTS Terrestrial Radio Access Network
+---------------
+ZTE Modem ZPAS output:
+ No Service
+ Limited Service
+ EDGE
+ GPRS
+ GSM
+ HSDPA
+ HSUPA
+ UMTS
+*/
+    err = at_tok_nextstr(&line, &(responseStr[3]));
+    ALOGD("ZPAS network type: %s", responseStr[3]);
+    if (0 == strcmp(responseStr[3], "EDGE"))            response[3] = 3;
+    if (0 == strcmp(responseStr[3], "GPRS"))            response[3] = 1;
+    if (0 == strcmp(responseStr[3], "GSM"))             response[3] = 0;
+    if (0 == strcmp(responseStr[3], "HSPA"))            response[3] = 4;
+    if (0 == strcmp(responseStr[3], "HSDPA"))           response[3] = 4;
+    if (0 == strcmp(responseStr[3], "HSUPA"))           response[3] = 5;
+    if (0 == strcmp(responseStr[3], "UMTS"))            response[3] = 2;
+    if (0 == strcmp(responseStr[3], "No Service"))      response[3] = -1;
+    if (0 == strcmp(responseStr[3], "Limited Service")) response[3] = -1;
+    asprintf(&responseStr[1], "%x", 0x1); /* fake LAC */
+    asprintf(&responseStr[2], "%x", 0x1); /* fake CID */
+    asprintf(&responseStr[3], "%d", response[3]);
 
     RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, count*sizeof(char*));
     at_response_free(p_response);
@@ -1304,7 +1381,7 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
         TTY_USBDEV 
 	" 115200 linkname datakey unit 1"
         " crtscts usepeerdns noauth defaultroute noipdefault ipcp-accept-local"
-	" ipcp-accept-remote ipcp-max-failure 30 lcp-echo-interval 5 
+	" ipcp-accept-remote ipcp-max-failure 30 lcp-echo-interval 5 "
         " lcp-echo-failure 30 modem dump debug kdebug 8");
 
     ALOGI("Executing '%s'", pppd_cmd);
@@ -1634,6 +1711,9 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             break;
         case RIL_REQUEST_RADIO_POWER:
             requestRadioPower(data, datalen, t);
+            break;
+        case RIL_REQUEST_BASEBAND_VERSION:
+            requestBasebandVersion(data, datalen, t);
             break;
         case RIL_REQUEST_DTMF: {
             char c = ((char *)data)[0];
@@ -2101,12 +2181,16 @@ static void initializeCallback(void *param)
     /* note: we don't check errors here. Everything important will
        be handled in onATTimeout and onATReaderClosed */
 
+    /* ZTE modem - reset */
+    at_send_command("ATZ", NULL);
+
     /*  atchannel is tolerant of echo but it must */
     /*  have verbose result codes */
     at_send_command("ATE0Q0V1", NULL);
 
-    /*  No auto-answer */
+    /*  No auto-answer 
     at_send_command("ATS0=0", NULL);
+    */
 
     /*  Extended errors */
     at_send_command("AT+CMEE=1", NULL);
@@ -2124,21 +2208,21 @@ static void initializeCallback(void *param)
     /*  GPRS registration events */
     at_send_command("AT+CGREG=1", NULL);
 
-    /*  Call Waiting notifications */
+    /*  Call Waiting notifications 
     at_send_command("AT+CCWA=1", NULL);
 
-    /*  Alternating voice/data off */
+    /*  Alternating voice/data off
     at_send_command("AT+CMOD=0", NULL);
 
-    /*  Not muted */
+    /*  Not muted 
     at_send_command("AT+CMUT=0", NULL);
 
-    /*  +CSSU unsolicited supp service notifications */
+    /*  +CSSU unsolicited supp service notifications
     at_send_command("AT+CSSN=0,1", NULL);
 
-    /*  no connected line identification */
+    /*  no connected line identification
     at_send_command("AT+COLP=0", NULL);
-
+    */
     /*  HEX character set */
     at_send_command("AT+CSCS=\"HEX\"", NULL);
 
